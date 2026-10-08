@@ -1,0 +1,28 @@
+{
+  "kind": "univ4_hook",
+  "hook": {
+    "contract": "SIMDTESTHook",
+    "constructorArgs": ["$poolManager", "$token"],
+    "permissions": [
+      "beforeInitialize",
+      "beforeAddLiquidity",
+      "beforeSwap",
+      "afterSwap",
+      "beforeSwapReturnDelta",
+      "afterSwapReturnDelta"
+    ]
+  },
+  "token": {
+    "contract": "SIMDTEST",
+    "name": "SIMDTEST",
+    "symbol": "SIMDTEST",
+    "decimals": 18
+  },
+  "pool": {
+    "pairedCurrency": "0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "SIMDTEST/IMD launch on Uniswap v4, Ethereum mainnet. Hook SIMDTESTHook(IPoolManager manager, address token): $poolManager is the chain's PoolManager (0x000000000004444c5dc75cB358380D2e3dE08A90 on mainnet), $token is the SIMDTEST token deployed just before the hook. IMD (0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7) and the treasury (0x3dD5F73dD1A4E62630fAd3909673F130aD429985) are constants in source; the hook has no owner, setters, pause, proxy, delegatecall or selfdestruct. The hook's deployer (msg.sender of the constructor, i.e. $factory) becomes the one-time initializer: beforeInitialize is restricted to the PoolManager, accepts only that initializer, only the exact pool key below, only once, and returns IHooks.beforeInitialize.selector. The hook hard-codes its pool key: currencies {SIMDTEST, IMD} sorted by address, LP fee 12500 (static 1.25%, the launch policy tier), tickSpacing 60, hooks = itself; any other key reverts WrongPool. Permissions listed are exactly getHookPermissions() at a 0x28cc address (low 14 bits): beforeInitialize, beforeAddLiquidity, beforeSwap, afterSwap, beforeSwapReturnDelta, afterSwapReturnDelta. The beforeAddLiquidity bit is address-derived: the constructor also accepts 0x20cc (no liquidity gate), but production must mine 0x28cc as script/MineHook.s.sol does; this manifest declares the gated deployment. Fees, all in IMD: (1) anti-snipe, 30% at the opening block falling by 3% per block to 0% at block offset 10, donated to in-range liquidity via PoolManager.donate inside afterSwap; (2) treasury 0.5% of IMD volume on every swap, sent via PoolManager.take to the treasury. Aggregate hook rate never exceeds 30.5% and is 0.5% from offset 10 onward. While the anti-snipe rate is nonzero, beforeAddLiquidity rejects non-full-range positions from anyone but the initializer (prevents JIT recapture of the donation); liquidity removal is never restricted. IMD-specified swaps (exact-input buys, exact-output sells) revert on partial fills; IMD-unspecified swaps fill normally. Token: SIMDTEST, 18 decimals, fixed 1e9 supply, no constructor args, tax-free transfers; its constructor sends 10% of supply to 0x...dEaD and 90% to its deployer. The factory must seed 80% of supply into this pool. initialPrice: the brief names no price. 79228162514264337593543950336 is 2^96 (1:1 SIMDTEST:IMD), the price the accepted tests initialize with; it is the only value invariant to which currency sorts first, since the token address is not known before deployment. The price must lie strictly inside the full-range ticks [-887220, 887220]. If the requester wants a different launch price or IMD seed, that is a launch-policy/factory input, not a hook change. The supplied SIMDTESTLaunch helper is optional bootstrap code, not part of this manifest."
+}
