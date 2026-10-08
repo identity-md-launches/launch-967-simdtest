@@ -12,6 +12,9 @@ import {BeforeSwapDelta, toBeforeSwapDelta} from "@uniswap/v4-core/src/types/Bef
 
 /// @notice Immutable IMD fees for exactly one SIMDTEST/IMD pool.
 /// @dev IMD-specified swaps must fill completely; partial fills revert instead of overcharging.
+/// @dev Deploy at an address whose low 14 bits equal HOOK_FLAGS. The beforeAddLiquidity bit enables
+/// the anti-snipe liquidity gate; the PoolManager only calls callbacks whose bit is set, so an address
+/// with HOOK_FLAGS_UNGATED is accepted but has no gate. Every other bit is mandatory.
 contract SIMDTESTHook {
     using PoolIdLibrary for PoolKey;
 
@@ -19,11 +22,14 @@ contract SIMDTESTHook {
     address public constant TREASURY = 0x3dD5F73dD1A4E62630fAd3909673F130aD429985;
     uint24 public constant LP_FEE = 12_500;
     int24 public constant TICK_SPACING = 60;
+    int24 public constant MIN_TICK = -887_220;
+    int24 public constant MAX_TICK = 887_220;
     uint256 public constant BPS = 10_000;
     uint256 public constant TREASURY_BPS = 50;
     uint256 public constant MAX_ANTI_SNIPE_BPS = 3_000;
     uint256 public constant ANTI_SNIPE_BLOCKS = 10;
-    uint160 public constant HOOK_FLAGS = 0x20cc;
+    uint160 public constant HOOK_FLAGS = 0x28cc;
+    uint160 public constant HOOK_FLAGS_UNGATED = 0x20cc;
 
     IPoolManager public immutable poolManager;
     address public immutable token;
@@ -42,6 +48,7 @@ contract SIMDTESTHook {
     error NotOpened();
     error InvalidAmount();
     error PartialFillUnsupported();
+    error OnlyFullRangeDuringAntiSnipe();
 
     event PoolOpened(PoolId indexed id, uint256 blockNumber);
     event FeesCharged(
@@ -66,12 +73,18 @@ contract SIMDTESTHook {
         _;
     }
 
-    function getHookPermissions() public pure returns (Hooks.Permissions memory p) {
+    function getHookPermissions() public view returns (Hooks.Permissions memory p) {
         p.beforeInitialize = true;
+        p.beforeAddLiquidity = liquidityGateEnabled();
         p.beforeSwap = true;
         p.afterSwap = true;
         p.beforeSwapReturnDelta = true;
         p.afterSwapReturnDelta = true;
+    }
+
+    /// @notice True when this address carries the beforeAddLiquidity bit, so the PoolManager calls the gate.
+    function liquidityGateEnabled() public view returns (bool) {
+        return uint160(address(this)) & Hooks.BEFORE_ADD_LIQUIDITY_FLAG != 0;
     }
 
     function poolKey() public view returns (PoolKey memory) {
@@ -96,6 +109,23 @@ contract SIMDTESTHook {
         openingBlock = block.number;
         emit PoolOpened(poolId, block.number);
         return IHooks.beforeInitialize.selector;
+    }
+
+    /// @notice While the anti-snipe fee is nonzero, only full-range positions can be added, except by the
+    /// initializer's seeding. A narrow position at a swap's end tick would otherwise let the swapper
+    /// capture its own donation; a full-range position is bounded by real capital on both sides.
+    function beforeAddLiquidity(
+        address sender,
+        PoolKey calldata key,
+        IPoolManager.ModifyLiquidityParams calldata params,
+        bytes calldata
+    ) external view onlyPoolManager returns (bytes4) {
+        _checkPool(key);
+        if (
+            antiSnipeBps() != 0 && sender != initializer
+                && (params.tickLower != MIN_TICK || params.tickUpper != MAX_TICK)
+        ) revert OnlyFullRangeDuringAntiSnipe();
+        return IHooks.beforeAddLiquidity.selector;
     }
 
     /// @notice 3000, 2700, ..., 300 bps at offsets 0..9; zero from offset 10 onward.
@@ -141,6 +171,10 @@ contract SIMDTESTHook {
             uint256 expected = params.amountSpecified < 0 ? gross - fee : gross;
             if (executed != expected) revert PartialFillUnsupported();
             volume = gross;
+        } else if (imdDelta < 0) {
+            // Exact-output buy: the pool's IMD input is net of the hook fee. Gross it up so the fee
+            // base matches an exact-input buy of the same size.
+            volume = _grossForNet(executed);
         }
         (uint256 donation, uint256 treasuryFee) = feesOn(volume);
         // Each call creates a debt for this hook. The returned hook delta credits exactly
@@ -158,15 +192,17 @@ contract SIMDTESTHook {
         view
         returns (uint256 gross, uint256 fee)
     {
-        if (params.amountSpecified < 0) {
-            gross = uint256(-params.amountSpecified);
-        } else {
-            // Smallest gross whose net (gross - floor(gross * rate / BPS)) equals requested output.
-            uint256 net = uint256(params.amountSpecified);
-            gross = (net - 1) * BPS / (BPS - antiSnipeBps() - TREASURY_BPS) + 1;
-        }
+        gross = params.amountSpecified < 0
+            ? uint256(-params.amountSpecified)
+            : _grossForNet(uint256(params.amountSpecified));
         (uint256 donation, uint256 treasuryFee) = feesOn(gross);
         fee = donation + treasuryFee;
+    }
+
+    /// @notice Smallest gross whose net (gross - floor(gross * rate / BPS)) equals `net`; zero for zero.
+    function _grossForNet(uint256 net) private view returns (uint256) {
+        if (net == 0) return 0;
+        return (net - 1) * BPS / (BPS - antiSnipeBps() - TREASURY_BPS) + 1;
     }
 
     function _imdSpecified(IPoolManager.SwapParams calldata params) private view returns (bool) {

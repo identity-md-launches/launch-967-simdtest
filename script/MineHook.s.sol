@@ -18,7 +18,7 @@ contract MineHook {
             predicted = address(
                 uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(launch), salt, initHash))))
             );
-            if (uint160(predicted) & 0x3fff == 0x20cc && predicted.code.length == 0) {
+            if (uint160(predicted) & 0x3fff == 0x28cc && predicted.code.length == 0) {
                 return (salt, predicted);
             }
         }

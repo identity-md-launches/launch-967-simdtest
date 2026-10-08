@@ -47,6 +47,8 @@ contract SIMDTESTLaunchTest is TestBase {
         SIMDTESTHook hook = launcher.launch(Q96, 800_000_001 ether, salt);
         assertEq(address(hook), predicted);
         assertEq(launcher.predictHook(salt), predicted);
+        assertTrue(hook.liquidityGateEnabled());
+        assertEq(uint256(uint160(address(hook)) & 0x3fff), uint256(hook.HOOK_FLAGS()));
         assertTrue(launcher.launched());
         assertEq(token.balanceOf(address(manager)), 800_000_000 ether);
         assertEq(token.balanceOf(address(this)), 100_000_000 ether);
@@ -127,7 +129,10 @@ contract SIMDTESTLaunchTest is TestBase {
         vm.expectRevert(SIMDTESTLaunch.InvalidPriceOrLiquidity.selector);
         launcher.launch(TickMath.getSqrtPriceAtTick(887220), 1e33, salt);
         bytes32 badSalt = bytes32(uint256(salt) + 1);
-        while (uint160(launcher.predictHook(badSalt)) & 0x3fff == 0x20cc) {
+        while (
+            uint160(launcher.predictHook(badSalt)) & 0x3fff == 0x28cc
+                || uint160(launcher.predictHook(badSalt)) & 0x3fff == 0x20cc
+        ) {
             badSalt = bytes32(uint256(badSalt) + 1);
         }
         vm.expectRevert();

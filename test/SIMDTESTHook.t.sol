@@ -18,8 +18,10 @@ import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {BeforeSwapDeltaLibrary} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
+import {CustomRevert} from "@uniswap/v4-core/src/libraries/CustomRevert.sol";
+import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
 
-abstract contract HookIntegration is TestBase {
+abstract contract HookIntegration is TestBase, IUnlockCallback {
     using StateLibrary for IPoolManager;
     using TransientStateLibrary for IPoolManager;
     using BeforeSwapDeltaLibrary for *;
@@ -64,14 +66,22 @@ abstract contract HookIntegration is TestBase {
     }
 
     function _deployHook(address tokenAddress) internal returns (SIMDTESTHook result) {
-        bytes32 initHash =
-            keccak256(abi.encodePacked(type(SIMDTESTHook).creationCode, abi.encode(manager, tokenAddress)));
+        return _deployHookWithFlags(tokenAddress, 0x28cc);
+    }
+
+    function _deployHookWithFlags(address tokenAddress, uint160 flags)
+        internal
+        returns (SIMDTESTHook result)
+    {
+        bytes32 initHash = keccak256(
+            abi.encodePacked(type(SIMDTESTHook).creationCode, abi.encode(manager, tokenAddress))
+        );
         for (uint256 i; i < 1_000_000; ++i) {
             bytes32 salt = bytes32(i);
             address predicted = address(
                 uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(this), salt, initHash))))
             );
-            if (uint160(predicted) & 0x3fff == 0x20cc && predicted.code.length == 0) {
+            if (uint160(predicted) & 0x3fff == flags && predicted.code.length == 0) {
                 result = new SIMDTESTHook{salt: salt}(manager, tokenAddress);
                 assertEq(address(result), predicted);
                 return result;
@@ -155,8 +165,10 @@ abstract contract HookIntegration is TestBase {
         o = _observe();
         {
             uint256 rawVolume = o.rawImd < 0 ? uint256(-int256(o.rawImd)) : uint256(int256(o.rawImd));
-            uint256 volume = buy && exactInput ? amount : rawVolume;
             uint256 antiRate = offset < 10 ? 3000 - 300 * offset : 0;
+            // Buys use the gross IMD outlay as the base in both modes; sells use the gross pool output.
+            uint256 volume = buy ? (exactInput ? amount : _grossForNet(rawVolume, antiRate + 50)) : rawVolume;
+            if (buy && !exactInput) assertEq(volume - volume * (antiRate + 50) / 10_000, rawVolume);
             uint256 expectedTreasury = volume * 50 / 10_000;
             uint256 expectedDonation = volume * (antiRate + 50) / 10_000 - expectedTreasury;
             assertEq(o.volume, volume);
@@ -188,6 +200,10 @@ abstract contract HookIntegration is TestBase {
         else assertEq(uint256(int256(output)), amount);
     }
 
+    function _grossForNet(uint256 net, uint256 rate) internal pure returns (uint256) {
+        return net == 0 ? 0 : (net - 1) * 10_000 / (10_000 - rate) + 1;
+    }
+
     function test_AllTenBlocksAndBoundary_AllSwapModes() public {
         for (uint256 offset; offset <= 11; ++offset) {
             uint256 snapshot = vm.snapshotState();
@@ -207,10 +223,11 @@ abstract contract HookIntegration is TestBase {
     }
 
     function test_DonationAccruesOnlyToInRangeLiquidity() public {
-        router.modify(key, 600, 1200, 1e20, bytes32(uint256(1)));
+        // Narrow out-of-range liquidity seeded through the initializer path, as a factory could.
+        _initializerModify(600, 1200, 1e20);
         Observed memory o = _checkTrade(false, true, 1 ether, 0);
         uint256 imdBefore = imd.balanceOf(address(this));
-        router.modify(key, 600, 1200, 0, bytes32(uint256(1)));
+        _initializerModify(600, 1200, 0);
         assertEq(imd.balanceOf(address(this)), imdBefore);
         router.modify(key, -887220, 887220, 0, 0);
         uint256 collected = imd.balanceOf(address(this)) - imdBefore;
@@ -232,13 +249,17 @@ abstract contract HookIntegration is TestBase {
     function test_InitializationAndPermissions() public view {
         assertTrue(hook.opened());
         assertEq(hook.openingBlock(), openedAt);
-        assertEq(uint256(uint160(address(hook)) & 0x3fff), 0x20cc);
+        assertEq(uint256(uint160(address(hook)) & 0x3fff), 0x28cc);
+        assertEq(uint256(hook.HOOK_FLAGS()), 0x28cc);
+        assertTrue(hook.liquidityGateEnabled());
+        assertEq(int256(hook.MIN_TICK()), int256(TickMath.minUsableTick(hook.TICK_SPACING())));
+        assertEq(int256(hook.MAX_TICK()), int256(TickMath.maxUsableTick(hook.TICK_SPACING())));
         Hooks.Permissions memory p = hook.getHookPermissions();
         assertTrue(
-            p.beforeInitialize && p.beforeSwap && p.afterSwap && p.beforeSwapReturnDelta
-                && p.afterSwapReturnDelta
+            p.beforeInitialize && p.beforeAddLiquidity && p.beforeSwap && p.afterSwap
+                && p.beforeSwapReturnDelta && p.afterSwapReturnDelta
         );
-        assertTrue(!p.afterInitialize && !p.beforeAddLiquidity && !p.beforeRemoveLiquidity && !p.beforeDonate);
+        assertTrue(!p.afterInitialize && !p.afterAddLiquidity && !p.beforeRemoveLiquidity && !p.beforeDonate);
         assertEq(address(hook.poolManager()), address(manager));
         assertEq(hook.initializer(), address(this));
         assertEq(hook.token(), address(token));
@@ -252,6 +273,184 @@ abstract contract HookIntegration is TestBase {
         hook.beforeSwap(address(this), key, params, "");
         vm.expectRevert(SIMDTESTHook.OnlyPoolManager.selector);
         hook.afterSwap(address(this), key, params, BalanceDelta.wrap(0), "");
+        vm.expectRevert(SIMDTESTHook.OnlyPoolManager.selector);
+        hook.beforeAddLiquidity(address(this), key, _liquidityParams(-887220, 887220, 1), "");
+    }
+
+    function _liquidityParams(int24 lower, int24 upper, int256 delta)
+        internal
+        pure
+        returns (IPoolManager.ModifyLiquidityParams memory)
+    {
+        return IPoolManager.ModifyLiquidityParams(lower, upper, delta, 0);
+    }
+
+    function _gateRevert() internal view returns (bytes memory) {
+        return abi.encodeWithSelector(
+            CustomRevert.WrappedError.selector,
+            address(hook),
+            IHooks.beforeAddLiquidity.selector,
+            abi.encodeWithSelector(SIMDTESTHook.OnlyFullRangeDuringAntiSnipe.selector),
+            abi.encodeWithSelector(Hooks.HookCallFailed.selector)
+        );
+    }
+
+    function test_SameBuyPaysSameFeesInBothModes() public {
+        for (uint256 offset; offset <= 10; offset += 5) {
+            uint256 snapshot = vm.snapshotState();
+            vm.roll(openedAt + offset);
+            vm.recordLogs();
+            BalanceDelta exactIn = router.swap(key, _params(true, true, 100 ether));
+            Observed memory a = _observe();
+            uint256 received = uint256(int256(hook.imdIsCurrency0() ? exactIn.amount1() : exactIn.amount0()));
+            assertTrue(vm.revertToState(snapshot));
+            snapshot = vm.snapshotState();
+            vm.roll(openedAt + offset);
+            vm.recordLogs();
+            BalanceDelta exactOut = router.swap(key, _params(true, false, received));
+            Observed memory b = _observe();
+            uint256 paid = uint256(-int256(hook.imdIsCurrency0() ? exactOut.amount0() : exactOut.amount1()));
+            assertLe(paid, 100 ether);
+            assertLe(100 ether - paid, 2);
+            assertLe(a.treasury > b.treasury ? a.treasury - b.treasury : b.treasury - a.treasury, 2);
+            assertLe(a.donation > b.donation ? a.donation - b.donation : b.donation - a.donation, 2);
+            assertLe(a.volume > b.volume ? a.volume - b.volume : b.volume - a.volume, 2);
+            assertTrue(vm.revertToState(snapshot));
+        }
+    }
+
+    function test_LiquidityGateOnlyFullRangeDuringAntiSnipe() public {
+        for (uint256 offset; offset < 10; ++offset) {
+            vm.roll(openedAt + offset);
+            assertTrue(hook.antiSnipeBps() != 0);
+            vm.expectRevert(_gateRevert());
+            router.modify(key, -60, 60, 1e18, 0);
+            vm.expectRevert(_gateRevert());
+            router.modify(key, -887220, 887160, 1e18, 0);
+            vm.expectRevert(_gateRevert());
+            router.modify(key, -887160, 887220, 1e18, 0);
+            router.modify(key, -887220, 887220, 1e18, bytes32(uint256(offset + 1)));
+            router.modify(key, -887220, 887220, -1e18, bytes32(uint256(offset + 1)));
+        }
+        vm.roll(openedAt + 10);
+        assertEq(hook.antiSnipeBps(), 0);
+        router.modify(key, -60, 60, 1e18, 0);
+        router.modify(key, -60, 60, -1e18, 0);
+    }
+
+    function test_LiquidityGateIgnoresOtherPools() public {
+        PoolKey memory wrong = key;
+        wrong.fee = 3000;
+        vm.prank(address(manager));
+        vm.expectRevert(SIMDTESTHook.WrongPool.selector);
+        hook.beforeAddLiquidity(address(this), wrong, _liquidityParams(-887220, 887220, 1), "");
+    }
+
+    function test_InitializerMaySeedAnyRangeDuringAntiSnipe() public {
+        assertEq(hook.initializer(), address(this));
+        _initializerModify(-60, 60, 1e18);
+        vm.expectRevert(_gateRevert());
+        router.modify(key, -60, 60, 1e18, 0);
+    }
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        assertEq(msg.sender, address(manager));
+        (int24 lower, int24 upper, int256 delta) = abi.decode(data, (int24, int24, int256));
+        (BalanceDelta d,) = manager.modifyLiquidity(key, _liquidityParams(lower, upper, delta), "");
+        _pay(key.currency0, d.amount0());
+        _pay(key.currency1, d.amount1());
+        return "";
+    }
+
+    function _pay(Currency currency, int128 amount) private {
+        if (amount > 0) {
+            manager.take(currency, address(this), uint256(int256(amount)));
+        } else if (amount < 0) {
+            manager.sync(currency);
+            MockIMD(Currency.unwrap(currency)).transfer(address(manager), uint256(-int256(amount)));
+            manager.settle();
+        }
+    }
+
+    /// @dev Adds or collects a position as the initializer, which the gate exempts (factory seeding).
+    function _initializerModify(int24 lower, int24 upper, int256 delta) internal {
+        manager.unlock(abi.encode(lower, upper, delta));
+    }
+
+    struct Attack {
+        uint256 baselineSpent;
+        uint256 baselineGot;
+        int24 endTick;
+        uint256 jitSpent;
+        uint256 jitGot;
+    }
+
+    function _buyNet(uint256 amount) private returns (uint256 spent, uint256 got) {
+        uint256 i0 = imd.balanceOf(address(this));
+        uint256 t0 = token.balanceOf(address(this));
+        router.swap(key, _params(true, true, amount));
+        spent = i0 - imd.balanceOf(address(this));
+        got = token.balanceOf(address(this)) - t0;
+    }
+
+    /// @dev The reviewer's attack: single-sided SIMDTEST liquidity at the buy's end tick, buy, remove.
+    function test_JitAtEndTickCannotRecoverOwnAntiSnipeFee() public {
+        router.modify(key, -887220, 887220, int256(8e26 - uint256(LIQUIDITY)), 0);
+        Attack memory a;
+        uint256 snapshot = vm.snapshotState();
+        (a.baselineSpent, a.baselineGot) = _buyNet(100_000_000 ether);
+        (, a.endTick,,) = manager.getSlot0(hook.poolId());
+        assertTrue(vm.revertToState(snapshot));
+        int24 lower = (a.endTick / 60) * 60;
+        if (a.endTick < 0 && a.endTick % 60 != 0) lower -= 60;
+        vm.expectRevert(_gateRevert());
+        router.modify(key, lower, lower + 60, 9 * 8e26, bytes32(uint256(7)));
+        (a.jitSpent, a.jitGot) = _buyNet(100_000_000 ether);
+        assertEq(a.jitSpent, a.baselineSpent);
+        assertEq(a.jitGot, a.baselineGot);
+        // Once the window closes, the same position is allowed but there is no donation to capture.
+        vm.roll(openedAt + 10);
+        router.modify(key, lower, lower + 60, 1e24, bytes32(uint256(7)));
+        router.modify(key, lower, lower + 60, -1e24, bytes32(uint256(7)));
+    }
+
+    /// @dev A full-range JIT is still possible but bounded by real two-sided capital: with 100M SIMDTEST
+    /// (the entire non-pool, non-dead supply) against an 800M seed the recovery is about 1/9 of the donation.
+    function test_FullRangeJitRecoveryIsBoundedByCapital() public {
+        router.modify(key, -887220, 887220, int256(8e26 - uint256(LIQUIDITY)), 0);
+        Attack memory a;
+        uint256 snapshot = vm.snapshotState();
+        (a.baselineSpent, a.baselineGot) = _buyNet(100_000_000 ether);
+        assertTrue(vm.revertToState(snapshot));
+        uint256 i0 = imd.balanceOf(address(this));
+        uint256 t0 = token.balanceOf(address(this));
+        router.modify(key, -887220, 887220, 1e26, bytes32(uint256(7)));
+        assertLe(t0 - token.balanceOf(address(this)), 100_000_000 ether);
+        _buyNet(100_000_000 ether);
+        router.modify(key, -887220, 887220, -1e26, bytes32(uint256(7)));
+        uint256 netSpent = i0 - imd.balanceOf(address(this));
+        uint256 netGot = token.balanceOf(address(this)) - t0;
+        uint256 baselinePrice = a.baselineSpent * 1e18 / a.baselineGot;
+        uint256 jitPrice = netSpent * 1e18 / netGot;
+        // Measured locally: about 0.8% off the baseline price, versus 27% for the end-tick attack.
+        assertLe(baselinePrice - jitPrice, baselinePrice * 2 / 100);
+        uint256 recovered = baselinePrice * netGot / 1e18 - netSpent;
+        assertLe(recovered, uint256(30_000_000 ether) / 9);
+    }
+
+    function test_UngatedAddressValidatesButHasNoGate() public {
+        SIMDTESTHook ungated = _deployHookWithFlags(address(token), 0x20cc);
+        assertTrue(!ungated.liquidityGateEnabled());
+        assertTrue(!ungated.getHookPermissions().beforeAddLiquidity);
+        assertEq(uint256(uint160(address(ungated)) & 0x3fff), uint256(ungated.HOOK_FLAGS_UNGATED()));
+        PoolKey memory ungatedKey = ungated.poolKey();
+        manager.initialize(ungatedKey, Q96);
+        assertTrue(ungated.antiSnipeBps() != 0);
+        router.modify(ungatedKey, -60, 60, 1e18, 0);
+        // Direct calls still enforce the rule; the manager simply never makes them at this address.
+        vm.prank(address(manager));
+        vm.expectRevert(SIMDTESTHook.OnlyFullRangeDuringAntiSnipe.selector);
+        ungated.beforeAddLiquidity(address(router), ungatedKey, _liquidityParams(-60, 60, 1), "");
     }
 
     function test_OnlyInitializerCanOpen() public {
@@ -345,11 +544,13 @@ abstract contract HookIntegration is TestBase {
             vm.recordLogs();
             router.swap(key, params);
             Observed memory o = _observe();
-            uint256 volume = o.rawImd < 0 ? uint256(-int256(o.rawImd)) : uint256(int256(o.rawImd));
-            assertTrue(volume < 1e25);
+            uint256 raw = o.rawImd < 0 ? uint256(-int256(o.rawImd)) : uint256(int256(o.rawImd));
+            assertTrue(raw < 1e25);
+            uint256 volume = buy ? _grossForNet(raw, 3050) : raw;
             assertEq(o.volume, volume);
             assertEq(o.treasury, volume / 200);
             assertEq(o.donation + o.treasury, volume * 3050 / 10_000);
+            if (buy) assertEq(volume - o.donation - o.treasury, raw);
             assertTrue(vm.revertToState(snapshot));
         }
     }
@@ -393,7 +594,7 @@ abstract contract HookIntegration is TestBase {
 
     function test_DonationCannotBeDivertedWhenSwapExhaustsActiveLiquidity() public {
         router.modify(key, -887220, 887220, -int256(uint256(LIQUIDITY)), 0);
-        router.modify(key, -60, 60, int256(uint256(LIQUIDITY)), 0);
+        _initializerModify(-60, 60, int256(uint256(LIQUIDITY)));
         IPoolManager.SwapParams memory params = _params(false, true, 1e25);
         (uint160 beforePrice,,,) = manager.getSlot0(hook.poolId());
         vm.expectRevert();
